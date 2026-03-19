@@ -267,7 +267,6 @@ impl DbServer {
         let server = self.clone();
         spawn::spawn_background(move || {
             let listener = TcpListener::from_std(std_listener).ok();
-            let server = server.clone();
             async move {
                 let listener = if let Some(l) = listener { l } else {
                     return Err(std::io::Error::other("listener error"));
