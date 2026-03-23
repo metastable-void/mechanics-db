@@ -292,7 +292,7 @@ impl DbServer {
                 #[allow(unreachable_code)]
                 Ok::<_, std::io::Error>(())
             }
-        }, false, Some("MechanicsDb"))?;
+        }, true, Some("MechanicsDb"))?;
         Ok(())
     }
 }
