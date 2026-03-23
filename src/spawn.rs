@@ -1,68 +1,52 @@
-pub fn spawn_blocking<
-    'a,
-    R: Send + 'static,
-    F: Future<Output = R> + Send + 'a,
-    C: FnOnce() -> F + Send + 'static,
->(
-    callback: C,
-    multithreaded: bool,
-    thread_name: Option<&str>,
-) -> Option<R> {
-    let mut builder = std::thread::Builder::new();
+use std::future::Future;
+use std::sync::Arc;
 
-    if let Some(name) = thread_name {
-        builder = builder.name(name.to_string());
-    }
-    builder
-        .spawn(move || {
-            let rt = if multithreaded {
-                tokio::runtime::Builder::new_multi_thread()
-            } else {
-                tokio::runtime::Builder::new_current_thread()
-            }
-            .enable_all()
-            .build()
-            .ok()?;
-
-            Some(rt.block_on(callback()))
-        })
-        .ok()
-        .map(|j| j.join().ok())??
+pub struct TokioRt {
+    runtime: tokio::runtime::Runtime,
 }
 
-pub fn spawn_background<
-    'a,
-    R: Send + 'static,
-    F: Future<Output = R> + Send + 'a,
-    C: FnOnce() -> F + Send + 'static,
->(
-    callback: C,
-    multithreaded: bool,
-    thread_name: Option<&str>,
-) -> std::io::Result<()> {
-    let mut builder = std::thread::Builder::new();
+impl TokioRt {
+    pub fn new(multithreaded: bool, thread_name: Option<&str>) -> std::io::Result<Self> {
+        let mut builder = if multithreaded {
+            tokio::runtime::Builder::new_multi_thread()
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+        };
 
-    if let Some(name) = thread_name {
-        builder = builder.name(name.to_string());
+        if let Some(name) = thread_name {
+            builder.thread_name(name);
+        }
+
+        let runtime = builder.enable_all().build()?;
+        Ok(Self { runtime })
     }
-    builder
-        .spawn(move || {
-            let rt = if multithreaded {
-                tokio::runtime::Builder::new_multi_thread()
-            } else {
-                tokio::runtime::Builder::new_current_thread()
-            }
-            .enable_all()
-            .build()
-            .ok();
-            
-            let rt = if let Some(r) = rt {
-                r
-            } else {
-                return;
-            };
 
-            rt.block_on(callback());
-        })
-        .map(|_| ())
+    pub fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        self.runtime.block_on(future)
+    }
+
+    pub fn spawn_background<R, F, C>(
+        self: Arc<Self>,
+        callback: C,
+        thread_name: Option<&str>,
+    ) -> std::io::Result<()>
+    where
+        R: Send + 'static,
+        F: Future<Output = R> + Send + 'static,
+        C: FnOnce() -> F + Send + 'static,
+    {
+        let mut builder = std::thread::Builder::new();
+        if let Some(name) = thread_name {
+            builder = builder.name(name.to_string());
+        }
+
+        builder
+            .spawn(move || {
+                let _ = self.block_on(callback());
+            })
+            .map(|_| ())
+    }
 }

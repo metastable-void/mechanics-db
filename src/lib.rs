@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::any::AnyArguments;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use crate::spawn::TokioRt;
 
 type HttpResponse = Response<Full<Bytes>>;
 type DbConn = Arc<Mutex<AnyConnection>>;
@@ -208,12 +209,12 @@ async fn handle_request(
     }
 }
 
-#[derive(Clone)]
 /// HTTP server wrapper around a shared [`AnyConnection`].
 ///
 /// The server exposes a single endpoint:
 /// `POST /api/v1/db/query` with a JSON SQL query payload.
 pub struct DbServer {
+    rt: Arc<TokioRt>,
     conn: Arc<Mutex<AnyConnection>>,
     tokens: Arc<RwLock<HashSet<String>>>,
 }
@@ -221,20 +222,20 @@ pub struct DbServer {
 impl DbServer {
     /// Creates a new server with an initialized DB connection.
     pub fn new(db_spec: &str) -> std::io::Result<Self> {
+        let rt = Arc::new(TokioRt::new(true, Some("MechanicsDb"))?);
         let db_spec = db_spec.to_owned();
-        spawn::spawn_blocking(move || {
-            let db_spec = db_spec.clone();
-
-            async move {
-                sqlx::any::install_default_drivers();
-                let conn = AnyConnection::connect(&db_spec).await.map_err(std::io::Error::other)?;
-                let conn = Arc::new(Mutex::new(conn));
-                Ok(Self {
-                    conn,
-                    tokens: Arc::new(RwLock::default()),
-                })
-            }
-        }, true, Some("DbServer::new")).ok_or(std::io::Error::other(""))?
+        let conn = rt.block_on(async move {
+            sqlx::any::install_default_drivers();
+            AnyConnection::connect(&db_spec)
+                .await
+                .map_err(std::io::Error::other)
+        })?;
+        let conn = Arc::new(Mutex::new(conn));
+        Ok(Self {
+            rt,
+            conn,
+            tokens: Arc::new(RwLock::default()),
+        })
     }
 
     /// Adds an approved Bearer token to this server.
@@ -265,34 +266,41 @@ impl DbServer {
         let std_listener = std::net::TcpListener::bind(bind_addr)?;
         std_listener.set_nonblocking(true)?;
 
-        let server = self.clone();
-        spawn::spawn_background(move || {
-            async move {
-                let listener = TcpListener::from_std(std_listener).ok();
-                let listener = if let Some(l) = listener { l } else {
-                    return Err(std::io::Error::other("listener error"));
+        let rt = Arc::clone(&self.rt);
+        let conn = self.conn();
+        let tokens = Arc::clone(&self.tokens);
+        rt.spawn_background(
+            move || async move {
+                let listener = match TcpListener::from_std(std_listener) {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        eprintln!("Error creating tokio listener: {err:?}");
+                        return;
+                    }
                 };
                 loop {
-                    let (stream, _) = listener.accept().await?;
+                    let (stream, _) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(err) => {
+                            eprintln!("Error accepting connection: {err:?}");
+                            break;
+                        }
+                    };
                     let io = TokioIo::new(stream);
-                    let conn = server.conn();
-                    let tokens = Arc::clone(&server.tokens);
+                    let conn = conn.clone();
+                    let tokens = Arc::clone(&tokens);
 
                     tokio::task::spawn(async move {
-                        let service = service_fn(move |req| {
-                            handle_request(conn.clone(), Arc::clone(&tokens), req)
-                        });
-                        if let Err(err) =
-                            http1::Builder::new().serve_connection(io, service).await
-                        {
+                        let service =
+                            service_fn(move |req| handle_request(conn.clone(), Arc::clone(&tokens), req));
+                        if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
                             eprintln!("Error serving connection: {err:?}");
                         }
                     });
                 }
-                #[allow(unreachable_code)]
-                Ok::<_, std::io::Error>(())
-            }
-        }, true, Some("MechanicsDb"))?;
+            },
+            Some("MechanicsDb"),
+        )?;
         Ok(())
     }
 }
