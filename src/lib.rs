@@ -190,7 +190,7 @@ async fn handle_request(
     tokens: Arc<RwLock<HashSet<String>>>,
     req: Request<Incoming>,
 ) -> Result<HttpResponse, Infallible> {
-    if req.method() != Method::POST || req.uri().path() != "/api/v1/mechanics" {
+    if req.method() != Method::POST || req.uri().path() != "/api/v1/db/query" {
         return Ok(ApiError::NotFound.to_response());
     }
     if !is_authorized(&tokens, &req) {
@@ -209,10 +209,10 @@ async fn handle_request(
 }
 
 #[derive(Clone)]
-/// HTTP server wrapper around a shared [`MechanicsPool`].
+/// HTTP server wrapper around a shared [`AnyConnection`].
 ///
 /// The server exposes a single endpoint:
-/// `POST /api/v1/mechanics` with a JSON [`MechanicsJob`] payload.
+/// `POST /api/v1/db/query` with a JSON SQL query payload.
 pub struct DbServer {
     conn: Arc<Mutex<AnyConnection>>,
     tokens: Arc<RwLock<HashSet<String>>>,
