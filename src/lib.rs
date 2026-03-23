@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use sqlx::{Arguments, Column, Connection, Row};
+use sqlx::{AnyPool, Arguments, Column, Row};
 use parking_lot::RwLock;
 
 use http_body_util::{BodyExt, Full};
@@ -14,15 +14,13 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use sqlx::AnyConnection;
 use serde::{Deserialize, Serialize};
 use sqlx::any::AnyArguments;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use crate::spawn::TokioRt;
 
 type HttpResponse = Response<Full<Bytes>>;
-type DbConn = Arc<Mutex<AnyConnection>>;
+type DbPool = AnyPool;
 
 enum ApiError {
     NotFound,
@@ -129,7 +127,7 @@ async fn parse_json_query(req: Request<Incoming>) -> Result<DbQuery, ApiError> {
 }
 
 async fn execute_query(
-    conn: DbConn,
+    pool: DbPool,
     query: DbQuery,
 ) -> Result<serde_json::Value, ApiError> {
     let mut arguments = AnyArguments::default();
@@ -157,8 +155,7 @@ async fn execute_query(
         }
     }
     let query = sqlx::query_with(&query.query, arguments);
-    let mut conn = conn.lock().await;
-    let res = query.fetch_all(&mut *conn).await.map_err(|e| ApiError::Db(e.to_string()))?;
+    let res = query.fetch_all(&pool).await.map_err(|e| ApiError::Db(e.to_string()))?;
 
     let mut arr = Vec::with_capacity(res.len());
     for row in res {
@@ -187,7 +184,7 @@ async fn execute_query(
 }
 
 async fn handle_request(
-    conn: DbConn,
+    pool: DbPool,
     tokens: Arc<RwLock<HashSet<String>>>,
     req: Request<Incoming>,
 ) -> Result<HttpResponse, Infallible> {
@@ -203,19 +200,19 @@ async fn handle_request(
         Err(error) => return Ok(error.to_response()),
     };
 
-    match execute_query(conn, job).await {
+    match execute_query(pool, job).await {
         Ok(result) => Ok(json_response(StatusCode::OK, &result)),
         Err(error) => Ok(error.to_response()),
     }
 }
 
-/// HTTP server wrapper around a shared [`AnyConnection`].
+/// HTTP server wrapper around a shared [`AnyPool`].
 ///
 /// The server exposes a single endpoint:
 /// `POST /api/v1/db/query` with a JSON SQL query payload.
 pub struct DbServer {
     rt: Arc<TokioRt>,
-    conn: Arc<Mutex<AnyConnection>>,
+    pool: AnyPool,
     tokens: Arc<RwLock<HashSet<String>>>,
 }
 
@@ -224,16 +221,15 @@ impl DbServer {
     pub fn new(db_spec: &str) -> std::io::Result<Self> {
         let rt = Arc::new(TokioRt::new(true, Some("MechanicsDb"))?);
         let db_spec = db_spec.to_owned();
-        let conn = rt.block_on(async move {
+        let pool = rt.block_on(async move {
             sqlx::any::install_default_drivers();
-            AnyConnection::connect(&db_spec)
+            AnyPool::connect(&db_spec)
                 .await
                 .map_err(std::io::Error::other)
         })?;
-        let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
             rt,
-            conn,
+            pool,
             tokens: Arc::new(RwLock::default()),
         })
     }
@@ -251,8 +247,8 @@ impl DbServer {
     }
 
     /// Returns a clone of the internal shared pool handle.
-    pub(crate) fn conn(&self) -> DbConn {
-        self.conn.clone()
+    pub(crate) fn pool(&self) -> DbPool {
+        self.pool.clone()
     }
 
     /// Starts the HTTP server on `bind_addr` in a dedicated thread.
@@ -267,7 +263,7 @@ impl DbServer {
         std_listener.set_nonblocking(true)?;
 
         let rt = Arc::clone(&self.rt);
-        let conn = self.conn();
+        let pool = self.pool();
         let tokens = Arc::clone(&self.tokens);
         rt.spawn_background(
             move || async move {
@@ -287,12 +283,12 @@ impl DbServer {
                         }
                     };
                     let io = TokioIo::new(stream);
-                    let conn = conn.clone();
+                    let pool = pool.clone();
                     let tokens = Arc::clone(&tokens);
 
                     tokio::task::spawn(async move {
                         let service =
-                            service_fn(move |req| handle_request(conn.clone(), Arc::clone(&tokens), req));
+                            service_fn(move |req| handle_request(pool.clone(), Arc::clone(&tokens), req));
                         if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
                             eprintln!("Error serving connection: {err:?}");
                         }
