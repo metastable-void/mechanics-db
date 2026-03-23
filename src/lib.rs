@@ -226,6 +226,7 @@ impl DbServer {
             let db_spec = db_spec.clone();
 
             async move {
+                sqlx::any::install_default_drivers();
                 let conn = AnyConnection::connect(&db_spec).await.map_err(std::io::Error::other)?;
                 let conn = Arc::new(Mutex::new(conn));
                 Ok(Self {
